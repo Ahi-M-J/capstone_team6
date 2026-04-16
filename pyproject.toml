@@ -1,0 +1,20 @@
+[project]
+name = "capstone-team6"
+version = "0.1.0"
+description = "Credit card spend analyser"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cohere>=6.1.0",
+    "docling>=2.86.0",
+    "fastapi>=0.135.3",
+    "langchain-community>=0.4.1",
+    "langchain-google-genai>=4.2.1",
+    "langchain-postgres>=0.0.17",
+    "langgraph>=1.1.6",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.26",
+    "streamlit>=1.56.0",
+    "uvicorn>=0.44.0",
+]
+
