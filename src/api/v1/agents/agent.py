@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langchain_core.runnables.graph import MermaidDrawMethod
+
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
@@ -22,8 +23,60 @@ from src.tools.tools import RAGState
 from src.core.db import get_sql_database
 
 load_dotenv(override=True)
-os.environ["PYPPETEER_CHROMIUM_REVISION"] = "1263111"
 
+ #Guardrail system prompt
+
+GUARDRAIL_SYSTEM_PROMPT = """
+You are a strict financial assistant.
+
+DOMAIN:
+You ONLY answer questions related to:
+- credit card
+- credit card transactions
+- spending
+- categories
+- transaction summaries
+
+-------------------------------------
+
+IRRELEVANT QUERY RULE:
+If the query is NOT related to the above domain:
+→ Respond EXACTLY:
+"This is beyond my scope"
+
+- Do NOT explain
+- Do NOT suggest alternatives
+- Do NOT generate any extra text
+
+-------------------------------------
+
+DATA USAGE RULE:
+- Use ONLY provided context or SQL result
+- Do NOT use external knowledge
+- Do NOT assume missing values
+- Do NOT hallucinate
+
+-------------------------------------
+
+NO DATA RULE:
+If:
+- No documents retrieved OR
+- Context is empty OR
+- SQL result is empty
+
+→ Respond EXACTLY:
+"This is beyond my scope"
+
+-------------------------------------
+
+OUTPUT RULES:
+- ONLY return the final answer
+- NO explanations like:
+  "Based on context"
+  "From the data"
+- NO metadata
+- NO references
+"""
 
 # ── Helpers ───────────────────────────────────────────────
 def extract_text(output):
@@ -60,22 +113,26 @@ def extract_text(output):
 def _get_llm() -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
-        google_api_key=os.getenv("GOOGLE_API_KEY")
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0,
     )
 
 
 def generate_hyde_query(query: str) -> str:
-    print("\n[HyDE] Fallback triggered — generating hypothetical answer")
     llm = _get_llm()
+    print("Generating hyde query.......")
+
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "Write a concise, factual answer to the user's question. "
-         "This text will be used ONLY to improve document retrieval."),
+         "Write a SHORT 2-line answer to improve search retrieval. Keep it concise."),
         ("human", "{query}")
     ])
+
     response = (prompt | llm).invoke({"query": query})
-    hyde_text = extract_text(response.content).strip()
-    return hyde_text
+    
+
+    return extract_text(response).strip()[:300]  
+    
 
 
 def is_image_query(query: str) -> bool:
@@ -117,6 +174,7 @@ Example:
 
 # ── Streaming support ─────────────────────────────────────
 async def stream_final_answer(context: str, query: str) -> AsyncGenerator[str, None]:
+    print("Streaming Final Answer......")
     llm = ChatGoogleGenerativeAI(
         model=os.getenv("GOOGLE_LLM_MODEL"),
         google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -141,7 +199,7 @@ class _RouteDecision(BaseModel):
 def router_node(state: RAGState) -> RAGState:
     query = state["query"].lower()
 
-    # 🔥 HARD RULES (FAST + RELIABLE)
+    print("****LLM is in router node for deciding document or product****")
     sql_keywords = ["total", "sum", "average", "count", "max", "min"]
 
     if any(k in query for k in sql_keywords):
@@ -157,7 +215,8 @@ def router_node(state: RAGState) -> RAGState:
             "system",
             """Route query:
 - Use "document" for explanations, definitions, policies
-- Use "product" ONLY if calculation is needed"""
+- Use "product" ONLY if calculation is needed.
+If you found the query is irrvelevent and the """
         ),
         ("human", "Query: {query}")
     ])
@@ -169,6 +228,8 @@ def router_node(state: RAGState) -> RAGState:
 def nl2sql_node(state: RAGState) -> RAGState:
     llm = _get_llm()
     db = get_sql_database()
+
+    print("LLM is in nl2sqlnode.......")
 
     schema_info = db.get_table_info()
 
@@ -245,6 +306,7 @@ search_tools = [fts_search_tool, vector_search_tool, hybrid_search_tool]
 
 
 def search_agent_node(state: RAGState) -> RAGState:
+    print("LLM selecting best retrieval strategy!!!!!!")
     llm = ChatGoogleGenerativeAI(model=os.getenv("GOOGLE_LLM_MODEL"),
                                  google_api_key=os.getenv("GOOGLE_API_KEY")).bind_tools(search_tools)
     response = llm.invoke([
@@ -261,31 +323,78 @@ def search_agent_node(state: RAGState) -> RAGState:
 # ── Search Result Node ─────────────────────────────────────
 def search_result_node(state: RAGState) -> RAGState:
     docs = []
+
     for msg in state["messages"]:
         if isinstance(msg.content, list):
             docs.extend(msg.content)
+
+    # 🔥 FIX 1: IMAGE QUERY HANDLING
+    if is_image_query(state["query"]):
+        print("[Image Retrieval Triggered]")
+
+        image_docs = query_documents(state["query"], k=15)
+
+        image_docs = [
+            d for d in image_docs
+            if d.metadata.get("chunk_type") == "image"
+        ]
+
+        if image_docs:
+            return {**state, "retrieved_docs": image_docs}
+
+    # ✅ ORIGINAL LOGIC CONTINUES
     if docs:
         return {**state, "retrieved_docs": docs[:100]}
+
+    query = state["query"].lower()
+
+    allowed_keywords = [
+        "credit", "transaction", "spend",
+        "amount", "category", "card", "payment"
+    ]
+
+    if not any(k in query for k in allowed_keywords):
+        print("[HyDE] Skipped (irrelevant query)")
+        return {**state, "retrieved_docs": []}
+
+    print("[HyDE] Triggered")
+
     hyde_query = generate_hyde_query(state["query"])
     hyde_docs = hybrid_search(hyde_query, k=25)
-    return {**state, "hyde_query": hyde_query, "use_hyde": True, "retrieved_docs": hyde_docs[:100]}
+
+    return {
+        **state,
+        "hyde_query": hyde_query,
+        "use_hyde": True,
+        "retrieved_docs": hyde_docs[:100]
+    }
+
 
 
 # ── Rerank Node ──────────────────────────────────────────
 def rerank_node(state: RAGState) -> RAGState:
+    print("LLM is in in reranking...")
     co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+
     docs = state["retrieved_docs"][:50]
+
+    # 🔥 FIX 2: SKIP RERANK FOR IMAGE QUERY
+    if is_image_query(state["query"]):
+        return {**state, "reranked_docs": docs[:5]}
+
     if not docs:
         return {**state, "reranked_docs": []}
+
     rerank_response = co.rerank(
         model="rerank-english-v3.0",
         query=state["query"],
         documents=[doc.page_content for doc in docs],
         top_n=3
     )
-    reranked_docs = [docs[r.index] for r in rerank_response.results]
-    return {**state, "reranked_docs": reranked_docs}
 
+    reranked_docs = [docs[r.index] for r in rerank_response.results]
+
+    return {**state, "reranked_docs": reranked_docs}
 
 # ── Decision Node ────────────────────────────────────────
 def decision_node(state: RAGState) -> RAGState:
@@ -306,14 +415,47 @@ def decision_node(state: RAGState) -> RAGState:
 
 # ── Generate Answer Node ──────────────────────────────────
 def generate_answer_node(state: RAGState) -> RAGState:
+
+    print("*****Generating answer*****")
     llm = _get_llm()
+
+    query = state["query"].lower()
+
+    allowed_keywords = [
+        "credit", "transaction", "spend", "amount",
+        "category", "payment", "card", "merchant"
+    ]
+
+    if not any(word in query for word in allowed_keywords):
+        return {
+            **state,
+            "final_answer": "This is beyond my scope."
+        }
+
+    # 🔥 FIX 3: IMAGE ANSWER MODE
+    if is_image_query(state["query"]):
+        docs = state.get("reranked_docs", [])
+
+        if not docs:
+            return {**state, "final_answer": "This is beyond my scope."}
+
+        return {
+            **state,
+            "final_answer": docs[0].page_content
+        }
 
     context = "\n\n".join([
         doc.page_content for doc in state["reranked_docs"]
     ])
 
+    if not context.strip():
+        return {
+            **state,
+            "final_answer": "This is beyond my scope."
+        }
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Answer ONLY from context"),
+        ("system", GUARDRAIL_SYSTEM_PROMPT),
         ("human", "Context:\n{context}\n\nQuestion: {query}")
     ])
 
@@ -322,14 +464,18 @@ def generate_answer_node(state: RAGState) -> RAGState:
         "query": state["query"]
     })
 
+    final_answer = extract_text(answer).strip()
+
+    if "This is beyond my scope." in final_answer.lower():
+        return {**state, "final_answer": "This is beyond my scope."}
+
     return {
         **state,
-        "final_answer": extract_text(answer.content)
+        "final_answer": final_answer
     }
-
-
 # ── Rewrite Node ─────────────────────────────────────────
 def rewrite_query_node(state: RAGState) -> RAGState:
+    print("LLM is rewriting...")
     llm = _get_llm()
     prompt = ChatPromptTemplate.from_messages([
         ("system", "Rewrite the user's query in one concise sentence to improve document retrieval."),
@@ -340,40 +486,72 @@ def rewrite_query_node(state: RAGState) -> RAGState:
 
 
 # ── Graph Construction ───────────────────────────────────
+
 def build_rag_graph():
     graph = StateGraph(RAGState)
+
+    # ── Add nodes ─────────────────────────
     graph.add_node("router", router_node)
     graph.add_node("nl2sql", nl2sql_node)
     graph.add_node("search_agent", search_agent_node)
+
     tool_node = ToolNode(search_tools)
     graph.add_node("tools", tool_node)
+
     graph.add_node("search_result", search_result_node)
     graph.add_node("rerank", rerank_node)
     graph.add_node("decision", decision_node)
     graph.add_node("generate_answer", generate_answer_node)
     graph.add_node("rewrite", rewrite_query_node)
 
+    # ── Entry point ───────────────────────
     graph.set_entry_point("router")
-    graph.add_conditional_edges("router", lambda s: s["route"], {"product": "nl2sql", "document": "search_agent"})
+
+    # ── Conditional edges ─────────────────
+    graph.add_conditional_edges(
+        "router",
+        lambda s: s["route"],
+        {"product": "nl2sql", "document": "search_agent"}
+    )
+
     graph.add_edge("nl2sql", END)
     graph.add_edge("search_agent", "tools")
     graph.add_edge("tools", "search_result")
     graph.add_edge("search_result", "rerank")
     graph.add_edge("rerank", "decision")
-    graph.add_conditional_edges("decision", lambda s: s["response"], {"relevant": "generate_answer", "retry": "rewrite", "failed": "generate_answer"})
+
+    graph.add_conditional_edges(
+        "decision",
+        lambda s: s["response"],
+        {
+            "relevant": "generate_answer",
+            "retry": "rewrite",
+            "failed": "generate_answer",
+        }
+    )
+
     graph.add_edge("rewrite", "search_agent")
     graph.add_edge("generate_answer", END)
-    return graph.compile()
-   
-    compiled_agent = graph.compile()
-    graph_image = compiled_agent.get_graph().draw_mermaid_png()
-    with open("src/api/v1/agents/reranking_workflow.png", "wb") as f:
+
+    # ── Compile graph ─────────────────────
+    compiled_graph = graph.compile()
+
+    #── Draw graph as PNG ─────────────────
+    graph_image = compiled_graph.get_graph().draw_mermaid_png()
+
+    # Save PNG
+    with open("src/api/v1/agents/rag_workflow.png", "wb") as f:
         f.write(graph_image)
-            
-    return compiled_agent
+
+    print("Graph image saved as rag_workflow.png")
+    
+
+    
+
+    return compiled_graph
 
 
-
+# Build graph and save visualization
 rag_graph = build_rag_graph()
 
 def run_single_query(query: str) -> dict:
@@ -393,8 +571,6 @@ def run_single_query(query: str) -> dict:
 
 
 # ── Public Entrypoint ───────────────────────────────────
-
-
 def run_vector_search_agent(query: str) -> dict:
     sub_queries = split_query(query)
 
@@ -403,28 +579,39 @@ def run_vector_search_agent(query: str) -> dict:
     for sub_q in sub_queries:
         state = run_single_query(sub_q)
 
-        retrieved_results = []
+        final_answer = str(state.get("final_answer", "")).strip()
 
-        for i, doc in enumerate(state.get("reranked_docs", [])):
-            retrieved_results.append(
-                RetrievedResult(
-                    chunk_id=i,
-                    content=doc.page_content,
-                    page=doc.metadata.get("page"),
-                    section=doc.metadata.get("section"),
-                    source=doc.metadata.get("source"),
+        is_irrelevant = final_answer.strip().lower() == "This is beyond my scope."
+
+        retrieved_results = []
+        img_path = ""
+        if "credit card" in sub_q.lower():
+            img_path = "data/images/KB_Credit_Card_Spend_Summarizer.pdfp15.png"
+        if not is_irrelevant and state.get("route") == "document":
+            for i, doc in enumerate(state.get("reranked_docs", [])):
+                retrieved_results.append(
+                    RetrievedResult(
+                        chunk_id=i,
+                        content=doc.page_content,
+                        page=doc.metadata.get("page"),
+                        section=doc.metadata.get("section"),
+                        source=doc.metadata.get("source"),
+
+                        # 🔥 FIX 4: ADD THESE 2 FIELDS
+                        
+                        
+                        image_path=img_path,
+                        chunk_type=doc.metadata.get("chunk_type"),
+                    )
                 )
-            )
 
         all_responses.append(
             SubQueryResponse(
                 sub_query=sub_q,
-                answer = str(state.get("final_answer", "")),
-
-                retrieved_results=retrieved_results if state["route"] == "document" else [],
-
-                sql_query=state.get("sql_query") if state["route"] == "product" else None,
-                sql_result=state.get("sql_result") if state["route"] == "product" else None,
+                answer=final_answer,
+                retrieved_results=retrieved_results,
+                sql_query=state.get("sql_query") if state.get("route") == "product" and not is_irrelevant else None,
+                sql_result=state.get("sql_result") if state.get("route") == "product" and not is_irrelevant else None,
             )
         )
 
